@@ -1,1 +1,297 @@
 
+hi say we have some custom authentication server that can act on the top of oidc to provide and check username and password simmilar to open source pingfederate 
+
+now say we are using cmanun 8 that has i dentity as componnet that handles auth role everything 
+
+now currently we have to go the idenity webpage and manage roles from there like for each indiduvuial user create a new role and give me acees to takslit operate whatever ocponet we want is there any way like we can have ldap system weer user belongs to a pritcual group can be granted access directy ? 
+
+Yes. You don't need to create a Camunda role assignment for every individual user. The architecture you are describing maps very naturally to OIDC groups → Camunda groups/roles.
+
+For Camunda 8 Self-Managed, the important feature is IdP groups / groups claim. Camunda can read the user's groups from the OIDC token and use those group IDs for authorization.
+
+Your architecture
+
+You could have:
+
+                    ┌──────────────────────┐
+                    │   Custom Auth Server  │
+                    │   OIDC Provider      │
+                    │                      │
+                    │ LDAP / AD            │
+                    │ users + groups       │
+                    └──────────┬───────────┘
+                               │
+                         OIDC login
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │    JWT Access Token  │
+                    │                      │
+                    │ sub: raman           │
+                    │ groups:              │
+                    │  ["camunda-ops"]     │
+                    └──────────┬───────────┘
+                               │
+                               ▼
+                    ┌──────────────────────┐
+                    │   Camunda Identity   │
+                    │                      │
+                    │ group: camunda-ops   │
+                    │       ↓              │
+                    │ role: Operate        │
+                    │ role: Tasklist       │
+                    └──────────────────────┘
+
+So imagine your LDAP contains:
+
+Raman
+ ├── Engineering
+ └── Camunda-Operators
+
+John
+ ├── Engineering
+ └── Camunda-Users
+
+Alice
+ └── Camunda-Admins
+
+Your OIDC server puts that group information into the token:
+
+{
+  "sub": "raman",
+  "preferred_username": "raman",
+  "groups": [
+    "Engineering",
+    "Camunda-Operators"
+  ]
+}
+
+Then in Camunda you associate:
+
+Camunda-Operators
+        │
+        ├── Operate role
+        └── Tasklist role
+
+Every user who belongs to Camunda-Operators automatically gets those permissions.
+
+Camunda explicitly supports assigning roles to groups, so members of the group inherit the role's permissions.
+
+The important part: LDAP doesn't necessarily talk directly to Camunda
+
+This is where your custom authentication server comes in.
+
+You can have:
+
+LDAP / Active Directory
+        │
+        │ user/group information
+        ▼
+Custom OIDC Provider
+        │
+        │ JWT containing groups
+        ▼
+Camunda Identity
+        │
+        ▼
+Tasklist / Operate / Admin
+
+Your custom authentication server is responsible for authenticating:
+
+username + password
+
+against LDAP/whatever user store you have.
+
+Then it issues the OIDC token.
+
+For example:
+
+{
+  "iss": "https://auth.company.com",
+  "sub": "12345",
+  "preferred_username": "raman",
+  "email": "raman@company.com",
+
+  "groups": [
+    "camunda-task-users",
+    "camunda-operators"
+  ]
+}
+
+Camunda can be configured to read the groups claim. The current Camunda documentation calls this configuration groups-claim; if configured, the group IDs extracted from the token can be used as Camunda group IDs. The IDs need to match exactly.
+
+There are actually two useful approaches
+Approach 1 — IdP groups
+
+This is probably what you're describing.
+
+Your auth server sends:
+
+"groups": [
+    "camunda-operators"
+]
+
+Then Camunda has:
+
+Group: camunda-operators
+          │
+          ▼
+Role: operate-user
+          │
+          ▼
+Operate permissions
+
+This means your application administrators don't have to manage:
+
+Raman → Role
+John  → Role
+Alice → Role
+...
+
+Instead they manage:
+
+LDAP/AD
+   │
+   └── camunda-operators
+          ├── Raman
+          ├── John
+          └── Alice
+
+And Camunda manages only:
+
+camunda-operators → operate-user
+
+That's a much cleaner model for enterprise environments.
+
+Approach 2 — OIDC mapping rules
+
+Camunda also has mapping rules for OIDC.
+
+For example, suppose your token contains:
+
+{
+  "groups": [
+    "CAMUNDA_OPERATORS"
+  ]
+}
+
+You could create a mapping rule such as:
+
+Claim:
+groups
+
+Value:
+CAMUNDA_OPERATORS
+
+and associate that mapping rule with a role.
+
+Conceptually:
+
+OIDC token
+    │
+    │ groups = CAMUNDA_OPERATORS
+    ▼
+Mapping Rule
+    │
+    ▼
+Camunda Role
+    │
+    ├── Operate
+    └── Tasklist
+
+Camunda's mapping rules specifically exist to map JWT claims from the OIDC provider into Camunda access control.
+
+What I would recommend for your architecture
+
+If you control the custom OIDC server, I'd make the group claim a first-class part of the token.
+
+For example:
+
+{
+  "sub": "user-123",
+  "preferred_username": "raman",
+  "groups": [
+    "engineering",
+    "camunda-task-users"
+  ]
+}
+
+Then define Camunda access groups around business/application access, not individual people:
+
+LDAP GROUP                         CAMUNDA ACCESS
+
+camunda-task-users       ────────→ Tasklist User
+camunda-operators        ────────→ Operate User
+camunda-admins           ────────→ Camunda Admin
+camunda-modelers         ────────→ Web Modeler
+
+Now onboarding becomes:
+
+New employee
+     │
+     ▼
+LDAP user created
+     │
+     ▼
+Add user to camunda-task-users
+     │
+     ▼
+User logs into Camunda
+     │
+     ▼
+OIDC token contains:
+groups = ["camunda-task-users"]
+     │
+     ▼
+Camunda recognizes group
+     │
+     ▼
+Tasklist access
+
+No Camunda UI operation is required for every employee.
+
+One important distinction
+
+There are three different things here:
+
+Authentication
+    ↓
+"Who are you?"
+    ↓
+OIDC / Custom Auth Server / LDAP
+
+
+Group membership
+    ↓
+"What organization/group do you belong to?"
+    ↓
+LDAP → OIDC groups claim
+
+
+Authorization
+    ↓
+"What can that group do in Camunda?"
+    ↓
+Camunda Role / Authorization
+
+So you shouldn't try to put all authorization logic into LDAP.
+
+Instead:
+
+LDAP
+  ↓
+Group membership
+
+OIDC
+  ↓
+Expose groups in JWT
+
+Camunda
+  ↓
+Group → Role → Permissions
+
+That separation is clean.
+
+Also, in Camunda 8.7 Self-Managed, Identity is designed to work with users managed by Keycloak or a connected IdP rather than requiring you to manually create/manage every human user in Identity.
+
+One caveat: Camunda 8.7's exact configuration differs from newer 8.8/8.9 documentation, so if you're specifically running 8.7, I can show you the exact application.yaml/environment variables and the exact JWT → LDAP group → Camunda Role flow for 8.7.
